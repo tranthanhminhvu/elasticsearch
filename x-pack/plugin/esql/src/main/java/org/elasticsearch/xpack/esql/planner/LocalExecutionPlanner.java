@@ -1648,7 +1648,6 @@ public class LocalExecutionPlanner {
             HighlightOptions.ORDER_SCORE.equals(options.order()),
             analyzerName,
             options.maxAnalyzedOffset()
-            // The query and each field's MemoryIndex slot must use the same analyzer.
         ).withExecutionContext(perField, translated.query(), fieldNames);
 
         List<ExpressionEvaluator.Factory> fieldEvaluators = highlight.fields()
