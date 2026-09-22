@@ -62,7 +62,6 @@ import org.elasticsearch.xpack.esql.expression.promql.function.PromqlFunctionReg
 import org.elasticsearch.xpack.esql.expression.promql.function.RegexExpand;
 import org.elasticsearch.xpack.esql.optimizer.rules.logical.TemporaryNameGenerator;
 import org.elasticsearch.xpack.esql.optimizer.rules.logical.TranslateTimeSeriesAggregate;
-import org.elasticsearch.xpack.esql.optimizer.rules.logical.promql.TranslationContext.Header;
 import org.elasticsearch.xpack.esql.optimizer.rules.logical.promql.TranslationContext.IntermediateResult;
 import org.elasticsearch.xpack.esql.optimizer.rules.logical.promql.TranslationContext.IntermediateResult.Kind;
 import org.elasticsearch.xpack.esql.parser.promql.PromqlLogicalPlanBuilder;
@@ -118,6 +117,7 @@ import java.util.Set;
 import static org.elasticsearch.xpack.esql.expression.function.aggregate.AggregateFunction.withFilter;
 import static org.elasticsearch.xpack.esql.expression.predicate.Predicates.combineAnd;
 import static org.elasticsearch.xpack.esql.expression.predicate.Predicates.combineAndNullable;
+import static org.elasticsearch.xpack.esql.optimizer.rules.logical.promql.TranslationContext.PassThrough;
 import static org.elasticsearch.xpack.esql.optimizer.rules.logical.promql.TranslationContext._LE;
 import static org.elasticsearch.xpack.esql.optimizer.rules.logical.promql.TranslationContext.bind;
 import static org.elasticsearch.xpack.esql.optimizer.rules.logical.promql.TranslationContext.filter;
@@ -125,6 +125,7 @@ import static org.elasticsearch.xpack.esql.optimizer.rules.logical.promql.Transl
 import static org.elasticsearch.xpack.esql.optimizer.rules.logical.promql.TranslationContext.finite;
 import static org.elasticsearch.xpack.esql.optimizer.rules.logical.promql.TranslationContext.mapFinite;
 import static org.elasticsearch.xpack.esql.optimizer.rules.logical.promql.TranslationContext.mapOpen;
+import static org.elasticsearch.xpack.esql.optimizer.rules.logical.promql.TranslationContext.of;
 import static org.elasticsearch.xpack.esql.optimizer.rules.logical.promql.TranslationContext.open;
 import static org.elasticsearch.xpack.esql.optimizer.rules.logical.promql.TranslationContext.select;
 import static org.elasticsearch.xpack.esql.optimizer.rules.logical.promql.TranslationContext.sub;
@@ -178,7 +179,7 @@ public final class TranslatePromqlToEsqlPlan extends AnalyzerRules.Parameterized
         /* Alias for the step bucket expression used in all aggregation groupings. May be null for empty indices. */
         Alias stepBucketAlias,
         /* The columns the result subtree MUST expose. */
-        Header parentHeader,
+        TranslationContext parentHeader,
         /* The current translateIntermediate evaluation time (default: @timestamp). */
         Expression time
     ) {
@@ -219,7 +220,7 @@ public final class TranslatePromqlToEsqlPlan extends AnalyzerRules.Parameterized
 
             if (branches.size() == 1) {
                 IntermediateResult ir = translateIntermediate(cmd.promqlPlan(), cmd.stepId(), cmd.valueId());
-                return doTranslateFinal(ir.plan(), identityColumn(ir.header()), ir.kind().constant);
+                return doTranslateFinal(ir.plan(), identityColumn(ir.context()), ir.kind().constant);
             }
             // Compile every branch as its own module (own step/value ids, own shifted evaluation timestamp), then link.
             var intermediateResultPlan = doTranslateUnion(
@@ -268,10 +269,10 @@ public final class TranslatePromqlToEsqlPlan extends AnalyzerRules.Parameterized
                 var branchOutput = new ArrayList<Attribute>();
                 branchOutput.add(ir.valueColumn());
                 branchOutput.add(ir.step());
-                for (String label : ir.header().finiteColumns()) {
+                for (String label : ir.context().finiteColumns()) {
                     branchOutput.add(ir.getExpr(label));
                 }
-                Attribute identity = identityColumn(ir.header());
+                Attribute identity = identityColumn(ir.context());
                 if (identity != null) {
                     if (identity.name().equals(MetadataAttribute.TIMESERIES) == false) {
                         var alias = new Alias(source, MetadataAttribute.TIMESERIES, identity, new NameId());
@@ -351,14 +352,14 @@ public final class TranslatePromqlToEsqlPlan extends AnalyzerRules.Parameterized
             }
 
             Kind kind = ir.kind().constant ? Kind.CONSTANT : Kind.AFTER_INITIAL_AGGREGATE;
-            return new IntermediateResult(plan, ir.header(), valueAlias.toAttribute(), ir.step(), null, kind);
+            return new IntermediateResult(plan, ir.context(), valueAlias.toAttribute(), ir.step(), null, kind);
         }
 
         /** Folds a branch whose value depends on nothing but the step column into a compile-time step/value relation. */
         private IntermediateResult doTranslateTryInline(IntermediateResult result) {
             Attribute stepAttr = cmd.stepAttribute();
             if (result.kind().constant
-                || result.header().isEmpty() == false
+                || result.context().isEmpty() == false
                 || cmd.start().value() == null
                 || result.value().references().stream().allMatch(ref -> ref.semanticEquals(stepAttr)) == false) {
                 return result;
@@ -366,7 +367,7 @@ public final class TranslatePromqlToEsqlPlan extends AnalyzerRules.Parameterized
             var plan = PromqlLogicalPlanBuilder.buildLocalRelation(cmd);
             var step = plan.output().getFirst();
             var value = result.value().transformUp(Attribute.class, attr -> attr.semanticEquals(stepAttr) ? step : attr);
-            return new IntermediateResult(plan, value, step, result.pendingFilter(), Kind.CONSTANT);
+            return new IntermediateResult(plan, PassThrough, value, step, result.pendingFilter(), Kind.CONSTANT);
         }
 
         /**
@@ -409,7 +410,7 @@ public final class TranslatePromqlToEsqlPlan extends AnalyzerRules.Parameterized
         private IntermediateResult doTranslateAcrossSeriesAgg(AcrossSeriesAggregate agg) {
             var partitionKey = mapFinite(agg.groupings());
             // IN: header describes a layout this node wants from a child subtree
-            Header in = switch (agg.grouping()) {
+            TranslationContext in = switch (agg.grouping()) {
                 // by(a,b,c): keep exactly {a,b,c}; rest is null-filled
                 case BY -> finite(partitionKey);
                 // without(a,b,c): declare the dropped set and widen every pending packed column by it.
@@ -418,7 +419,7 @@ public final class TranslatePromqlToEsqlPlan extends AnalyzerRules.Parameterized
                     ? parentHeader
                     : union(sub(parentHeader, finite(partitionKey)), open(finite(partitionKey)));
                 // this node doesn't have any requirement
-                case NONE -> Header.PassThrough;
+                case NONE -> PassThrough;
             };
 
             Translation translation = new Translation(cmd, analyzer, stepBucketAlias, in, time);
@@ -428,13 +429,13 @@ public final class TranslatePromqlToEsqlPlan extends AnalyzerRules.Parameterized
             }
 
             // OUT: header describes a layout this node produces
-            Header out = switch (agg.grouping()) {
+            TranslationContext out = switch (agg.grouping()) {
                 // BY(a,b,c): the result's label set is exactly its keys; whatever the parent needs beyond them is absent
                 // on the result and null-fills in the parent's regroup, so `parentHeader` is not part of the output.
                 case BY -> finite(mapFinite(agg.output()));
                 // The child columns selected by dropping the labels, as the aggregate's own grouping.
                 case WITHOUT -> regroupWithout(ir, finite(partitionKey));
-                case NONE -> Header.PassThrough;
+                case NONE -> PassThrough;
             };
 
             var promqlCtx = new PromqlContext(time, AggregateFunction.NO_WINDOW, ir.step(), configuration());
@@ -448,15 +449,15 @@ public final class TranslatePromqlToEsqlPlan extends AnalyzerRules.Parameterized
          * regroup that follows. Under a packed column the labels are derived columns, so only those the enclosing
          * translation asks for are carried; a finite table keeps every remaining label because they are its label set.
          */
-        private Header regroupWithout(IntermediateResult table, Header dropped) {
-            Header in = select(table.header(), dropped);
-            assert table.header().isOpen() == false || in.isOpen()
+        private TranslationContext regroupWithout(IntermediateResult table, TranslationContext dropped) {
+            TranslationContext in = select(table.context(), dropped);
+            assert table.context().isOpen() == false || in.isOpen()
                 : "invariant: parentHeader ["
                     + parentHeader
                     + "] must declare a packed column excluding "
                     + dropped
                     + ", got "
-                    + table.header();
+                    + table.context();
             return in.isOpen() ? filter(in, parentHeader) : in;
         }
 
@@ -476,7 +477,7 @@ public final class TranslatePromqlToEsqlPlan extends AnalyzerRules.Parameterized
             var partitionKey = mapFinite(plan.groupings());
 
             // IN: header describes a layout this node wants from a child subtree
-            Header in = union(parentHeader, open(), finite(partitionKey));
+            TranslationContext in = union(parentHeader, open(), finite(partitionKey));
             IntermediateResult childResult = new Translation(cmd, analyzer, stepBucketAlias, in, time).doTranslateNode(plan.child());
             if (childResult.kind().constant) {
                 return childResult;
@@ -484,7 +485,7 @@ public final class TranslatePromqlToEsqlPlan extends AnalyzerRules.Parameterized
 
             // OUT: header describes a layout this node produces;
             // partition labels are grouped even where the child lacks them (null-filled), so the ranking sees them
-            Header out = union(childResult.header(), finite(partitionKey));
+            TranslationContext out = union(childResult.context(), finite(partitionKey));
 
             var promqlCtx = new PromqlContext(time, AggregateFunction.NO_WINDOW, childResult.step(), configuration());
             IntermediateResult aggregated = aggregate(childResult, out, childResult.value());
@@ -529,14 +530,14 @@ public final class TranslatePromqlToEsqlPlan extends AnalyzerRules.Parameterized
          * input lacks. Without one, the aggregate runs over the table's own grain: every carried column stays a key.
          */
         private IntermediateResult aggregate(IntermediateResult input, Expression function) {
-            return aggregate(input, input.header(), function, false);
+            return aggregate(input, input.context(), function, false);
         }
 
-        private IntermediateResult aggregate(IntermediateResult input, Header grouping, Expression function) {
+        private IntermediateResult aggregate(IntermediateResult input, TranslationContext grouping, Expression function) {
             return aggregate(input, grouping, function, false);
         }
 
-        private IntermediateResult aggregate(IntermediateResult input, Header grouping, Expression function, boolean packed) {
+        private IntermediateResult aggregate(IntermediateResult input, TranslationContext grouping, Expression function, boolean packed) {
             Alias value = new Alias(function.source(), cmd.valueColumnName(), function);
             if (input.kind().afterInitialAggregation == false) {
                 assert input.kind() == Kind.BEFORE_INITIAL_AGGREGATE : "invariant: aggregates take raw or collapsed tables";
@@ -545,10 +546,10 @@ public final class TranslatePromqlToEsqlPlan extends AnalyzerRules.Parameterized
             return emitRegroup(input, grouping, value, grouping.isOpen() || packed);
         }
 
-        private static IntermediateResult table(LogicalPlan plan, IntermediateResult input, Alias value, Header header) {
+        private static IntermediateResult table(LogicalPlan plan, IntermediateResult input, Alias value, TranslationContext context) {
             return new IntermediateResult(
                 plan,
-                header,
+                context,
                 value.toAttribute(),
                 input.step(),
                 input.pendingFilter(),
@@ -560,7 +561,7 @@ public final class TranslatePromqlToEsqlPlan extends AnalyzerRules.Parameterized
          * The innermost aggregate groups on the child's already-defined columns. Packed groupings receive distinct
          * output names without exposing their source representation to the aggregate.
          */
-        private IntermediateResult emitCollapse(IntermediateResult input, Header grouping, Alias value) {
+        private IntermediateResult emitCollapse(IntermediateResult input, TranslationContext grouping, Alias value) {
             Source source = cmd.promqlPlan().source();
             LogicalPlan plan = input.plan();
             boolean groupsBySeries = grouping.isOpen() || grouping.finiteColumns().isEmpty() == false;
@@ -583,7 +584,7 @@ public final class TranslatePromqlToEsqlPlan extends AnalyzerRules.Parameterized
             // preserves per-series granularity while making the full header available to the surrounding query.
             // A packing is aliased to its derived name so the aggregate output does not expose its source representation;
             // the alias is a grouping expression the aggregate itself defines, so the null-fills are taken before it.
-            Header bound = bind(grouping, input.header());
+            TranslationContext bound = bind(grouping, input.context());
             List<Alias> nulls = bound.nullFills(plan);
             if (nulls.isEmpty() == false) {
                 plan = new Eval(source, plan, nulls);
@@ -597,7 +598,7 @@ public final class TranslatePromqlToEsqlPlan extends AnalyzerRules.Parameterized
                 columnExpr.put(mapOpen(col), packed.toAttribute());
             }
             bound.finiteColumns().forEach(name -> groupKeys.add(bound.getExpr(name)));
-            Header out = new Header(bound.finiteColumns(), bound.openColumns(), columnExpr);
+            TranslationContext out = of(bound.finiteColumns(), bound.openColumns(), columnExpr);
             plan = new TimeSeriesAggregate(
                 source,
                 plan,
@@ -615,7 +616,12 @@ public final class TranslatePromqlToEsqlPlan extends AnalyzerRules.Parameterized
          * grouping columns. A packed regroup additionally packs dimensions before aggregation to prevent multi-valued
          * dimensions from splitting rows and double-counting, then unpacks them afterwards.
          */
-        private IntermediateResult emitRegroup(IntermediateResult input, Header grouping, Alias value, boolean requiresPacking) {
+        private IntermediateResult emitRegroup(
+            IntermediateResult input,
+            TranslationContext grouping,
+            Alias value,
+            boolean requiresPacking
+        ) {
             Source source = cmd.source();
             Attribute step = input.step();
             LogicalPlan plan = input.plan();
@@ -623,7 +629,7 @@ public final class TranslatePromqlToEsqlPlan extends AnalyzerRules.Parameterized
                 value = value.replaceChild(new Values(value.child().source(), value.child()));
             }
             // a declared label the child lacks is absent from every series: grouped under null, like Prometheus
-            Header out = bind(grouping, input.header());
+            TranslationContext out = bind(grouping, input.context());
             List<Alias> nulls = out.nullFills(plan);
             if (nulls.isEmpty() == false) {
                 plan = new Eval(source, plan, nulls);
@@ -662,14 +668,14 @@ public final class TranslatePromqlToEsqlPlan extends AnalyzerRules.Parameterized
             projections.addAll(unpackedDims);
             Map<NameId, Attribute> unpacked = new HashMap<>();
             unpackedDims.forEach(attribute -> unpacked.put(attribute.id(), attribute));
-            Header rebound = out.map(expr -> unpacked.get(expr.id()));
+            TranslationContext rebound = out.map(expr -> unpacked.get(expr.id()));
             return table(new Project(source, unpackDims, projections), input, value, rebound);
         }
 
         private IntermediateResult doTranslateHistogramFunction(HistogramFunctionCall function) {
             // Classic histogram functions collapse the `le` bucket dimension like a `without (le)` would, and read the
             // bucket bound off the `le` column itself, so the child must also expose it by name.
-            Header in = union(sub(parentHeader, _LE), open(_LE), _LE);
+            TranslationContext in = union(sub(parentHeader, _LE), open(_LE), _LE);
             IntermediateResult result = new Translation(cmd, analyzer, stepBucketAlias, in, time).doTranslateNode(function.child());
             if (result.kind().constant) {
                 return result;
@@ -700,7 +706,7 @@ public final class TranslatePromqlToEsqlPlan extends AnalyzerRules.Parameterized
 
             // Bucket counts are consumed as doubles; counter buckets are frequently integer/long typed, so cast explicitly.
             // The `without (le)`-like regroup exposes the child columns selected by dropping the labels.
-            Header out = regroupWithout(result, _LE);
+            TranslationContext out = regroupWithout(result, _LE);
             Expression count = new ToDouble(function.source(), result.value());
 
             return aggregate(result, out, function.buildAggregateFunction(count, le), true);
@@ -709,15 +715,15 @@ public final class TranslatePromqlToEsqlPlan extends AnalyzerRules.Parameterized
         /** scalar(): collapse to one value per step, e.g. scalar(sum by (cluster) (metric)). */
         private IntermediateResult doTranslateScalarConvertion(ScalarConversionFunction scalarFunc) {
             // The result has no labels, so the child's label set is irrelevant: it exposes none.
-            IntermediateResult child = new Translation(cmd, analyzer, stepBucketAlias, Header.PassThrough, time).doTranslateNode(
+            IntermediateResult child = new Translation(cmd, analyzer, stepBucketAlias, PassThrough, time).doTranslateNode(
                 scalarFunc.child()
             );
             if (child.value().foldable()) {
                 Expression value = new ToDouble(scalarFunc.source(), child.value());
-                return new IntermediateResult(child.plan(), value, child.step(), child.pendingFilter());
+                return IntermediateResult.scalar(child.plan(), value, child.step(), child.pendingFilter());
             }
             var scalarExpr = new Scalar(scalarFunc.source(), child.value());
-            return aggregate(child, Header.PassThrough, scalarExpr);
+            return aggregate(child, PassThrough, scalarExpr);
         }
 
         /** Translates a generic PromQL function call (rate, ceil, abs, etc.) into an expression over the child's value. */
@@ -751,7 +757,7 @@ public final class TranslatePromqlToEsqlPlan extends AnalyzerRules.Parameterized
         private IntermediateResult doTranslateMetadataManipulation(MetadataManipulationFunction relabel) {
             // IN:
             // The child must expose the labels the derivation reads, on top of whatever the enclosing translation requires.
-            Header in = union(parentHeader, finite(relabel.sourceLabels()));
+            TranslationContext in = union(parentHeader, finite(relabel.sourceLabels()));
             IntermediateResult child = new Translation(cmd, analyzer, stepBucketAlias, in, time).doTranslateNode(relabel.child());
             if (child.kind().constant) {
                 return child;
@@ -780,7 +786,7 @@ public final class TranslatePromqlToEsqlPlan extends AnalyzerRules.Parameterized
             }
 
             // OUT:
-            Header out = bind(aggregated.header(), name, derived.toAttribute());
+            TranslationContext out = bind(aggregated.context(), name, derived.toAttribute());
 
             return aggregated.with(plan, out, aggregated.value());
         }
@@ -848,7 +854,7 @@ public final class TranslatePromqlToEsqlPlan extends AnalyzerRules.Parameterized
         /** Translates a scalar function (time(), etc.): an expression over the unchanged source. */
         private IntermediateResult doTranslateScalarFunc(ScalarFunction scalarFunction) {
             var function = scalarFunction.buildEsqlFunction(new PromqlContext(cmd.timestamp(), null, cmd.stepAttribute(), configuration()));
-            return new IntermediateResult(cmd.child(), function, stepAttr());
+            return IntermediateResult.scalar(cmd.child(), function, stepAttr());
         }
 
         /** Translates explicit vector matching as a join; other binary operators compose over a shared frame. */
@@ -897,7 +903,7 @@ public final class TranslatePromqlToEsqlPlan extends AnalyzerRules.Parameterized
                 ? Kind.AFTER_INITIAL_AGGREGATE
                 : Kind.BEFORE_INITIAL_AGGREGATE;
 
-            IntermediateResult result = new IntermediateResult(plan, ir.header(), null, ir.step(), filter, kind);
+            IntermediateResult result = new IntermediateResult(plan, ir.context(), null, ir.step(), filter, kind);
             return doTranslateAddValueEval(result, binaryExpr);
         }
 
@@ -913,7 +919,7 @@ public final class TranslatePromqlToEsqlPlan extends AnalyzerRules.Parameterized
             // Verifier admits only operands with concrete label sets here, so the join result names every label: the
             // operator's declared output plus whatever the enclosing translation asks for by name (null-filled when the
             // match dropped it). Packed columns stop at the join for that reason, not because joins are finite in general.
-            Header in = union(finite(mapFinite(op.output())), finite(parentHeader.finiteColumns()));
+            TranslationContext in = union(finite(mapFinite(op.output())), finite(parentHeader.finiteColumns()));
             VectorMatch match = op.match();
             if (match.filter() == VectorMatch.Filter.ON) {
                 in = union(union(finite(mapFinite(op.output())), finite(parentHeader.finiteColumns())), finite(match.filterLabels()));
@@ -1026,13 +1032,13 @@ public final class TranslatePromqlToEsqlPlan extends AnalyzerRules.Parameterized
                 if (foldedPlan != null) {
                     // a compile-time relation carries its own step column
                     Attribute foldedStep = find(foldedPlan.output(), cmd.stepColumnName());
-                    return new IntermediateResult(foldedPlan, literal, foldedStep, matcherExpression, Kind.CONSTANT);
+                    return new IntermediateResult(foldedPlan, PassThrough, literal, foldedStep, matcherExpression, Kind.CONSTANT);
                 }
-                return new IntermediateResult(input, literal, stepAttr(), matcherExpression);
+                return IntermediateResult.scalar(input, literal, stepAttr(), matcherExpression);
             }
             if (foldedPlan != null) {
                 var empty = new LocalRelation(cmd.source(), List.of(cmd.valueAttribute(), cmd.stepAttribute()), EmptyLocalSupplier.EMPTY);
-                return new IntermediateResult(empty, Literal.NULL, cmd.stepAttribute(), null, Kind.CONSTANT);
+                return new IntermediateResult(empty, PassThrough, Literal.NULL, cmd.stepAttribute(), null, Kind.CONSTANT);
             }
 
             // An instant selector maps to LastOverTime to get the latest sample per time series.
@@ -1054,11 +1060,11 @@ public final class TranslatePromqlToEsqlPlan extends AnalyzerRules.Parameterized
 
             // IN: only `parentHeader` labels that exist on the relation;
             // consumers null-fill any absent parentHeader label.
-            Header in = filter(parentHeader, finite(mapFinite(labelFields)));
+            TranslationContext in = filter(parentHeader, finite(mapFinite(labelFields)));
 
             // OUT: the requirement bound column by column to the relation;
             // a packed column is produced by a `TimeSeriesMetadataAttribute`, added to the relation if absent
-            Header out = in;
+            TranslationContext out = in;
 
             // packed columns
             var additional = new ArrayList<Attribute>();
@@ -1229,8 +1235,8 @@ public final class TranslatePromqlToEsqlPlan extends AnalyzerRules.Parameterized
      * The column carrying a table's series identity: its first packed column, the one with the fewest exclusions. Null
      * for a finite table. Named `_timeseries` when it excludes nothing, `_timeseries$…` otherwise.
      */
-    private static Attribute identityColumn(Header header) {
-        return header.isOpen() ? header.getExpr(header.openColumns().iterator().next()) : null;
+    private static Attribute identityColumn(TranslationContext context) {
+        return context.isOpen() ? context.getExpr(context.openColumns().iterator().next()) : null;
     }
 
     // -- pure helpers, independent of the running translation --

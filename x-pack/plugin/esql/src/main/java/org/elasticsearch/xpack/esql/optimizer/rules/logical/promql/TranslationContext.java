@@ -27,7 +27,9 @@ import java.util.LinkedHashMap;
 import java.util.LinkedHashSet;
 import java.util.List;
 import java.util.Map;
+import java.util.Objects;
 import java.util.Set;
+import java.util.SortedSet;
 import java.util.TreeSet;
 import java.util.function.UnaryOperator;
 
@@ -38,279 +40,377 @@ import static org.elasticsearch.xpack.esql.core.expression.Attribute.SYNTHETIC_A
 import static org.elasticsearch.xpack.esql.plan.logical.promql.PromqlLabels.PROMETHEUS_LABELS_PREFIX;
 
 /**
- * The tabular surface of a PromQL translation: the label columns of a table, as one {@link Header} that flows down as
- * the columns a subtree must expose and up as the columns it does expose. Going down the header is a requirement -
- * names only; coming up each column is bound to the output attribute of the plan producing it, so a child's output
- * header is directly the parent's input. {@link #bind(Header, Header)} does the binding at a node boundary, resolving every
- * required column to a plan attribute or a null-fill.
+ * PromQL translation context: the header of label columns plus value types for intermediate results.
+ * <p>
+ * Design goals:
+ * - Make illegal states unrepresentable (invariants enforced in constructors).
+ * - Put behavior on the context (algebra lives on {@link TranslationContext}).
+ * - No separate header type: {@code TranslationContext} *is* the header.
  */
 public final class TranslationContext {
 
-    private TranslationContext() {}
+    private final Set<String> finiteColumns;
+    private final SortedSet<Set<String>> openColumns;
+    private final Map<String, Attribute> columnExpr;
 
-    // -- core --
+    private static final Comparator<Set<String>> BY_EXCLUSIONS = Comparator.<Set<String>>comparingInt(Set::size)
+        .thenComparing(TranslationContext::mapOpen);
 
-    /**
-     * The label columns of a table. A regular column is one label; a packed column carries every runtime label except
-     * its exclusions, so an empty exclusion set is the full label space. Packed columns iterate by increasing exclusions
-     * (the first packs the most labels and so fixes the table's grain), so consumers turning a header into grouping keys
-     * need no further ordering.
-     * <p>
-     * {@code columnExpr} binds columns to the plan attributes producing them, keyed by canonical column name: a regular
-     * column by its label, a packed one by {@link #mapOpen}. A requirement binds nothing; a
-     * translated table's header is fully bound ({@link #isBound()}). Headers compose through the static algebra below
-     * ({@link #finite}, {@link #open}, {@link #union}, {@link #sub}, {@link #filter}, {@link #select}, {@link #bind}),
-     * which reads as the set expression it computes and keeps the bindings of the columns that survive.
-     */
-    public record Header(Set<String> finiteColumns, Set<Set<String>> openColumns, Map<String, Attribute> columnExpr) {
+    private TranslationContext(Set<String> finiteColumns, Set<Set<String>> openColumns, Map<String, Attribute> columnExpr) {
+        this.finiteColumns = unmodifiableSet(new LinkedHashSet<>(finiteColumns));
 
-        /** No columns: a scalar's header, and the identity of {@link #union}. */
-        public static final Header PassThrough = new Header();
-
-        /**
-         * Fewer exclusions lead. Ties break on the canonical name, which is unique per exclusion set, so the order is
-         * total and distinct packed columns of equal size never collide in the sorted set.
-         */
-        private static final Comparator<Set<String>> BY_EXCLUSIONS = Comparator.<Set<String>>comparingInt(Set::size)
-            .thenComparing(TranslationContext::mapOpen);
-
-        public Header() {
-            this(Set.of(), Set.of());
+        SortedSet<Set<String>> sorted = new TreeSet<>(BY_EXCLUSIONS);
+        for (Set<String> ex : openColumns) {
+            sorted.add(unmodifiableSet(new LinkedHashSet<>(ex)));
         }
+        this.openColumns = unmodifiableSortedSet(sorted);
 
-        /** A requirement: these columns, none bound. */
-        public Header(Set<String> finiteColumns, Set<Set<String>> openColumns) {
-            this(finiteColumns, openColumns, Map.of());
+        // Invariant: bindings must only refer to columns that exist in this context.
+        Set<String> allowed = names(this.finiteColumns, this.openColumns);
+        if (columnExpr.keySet().stream().anyMatch(name -> allowed.contains(name) == false)) {
+            throw new IllegalArgumentException("columnExpr contains names not present in header: " + columnExpr.keySet());
         }
-
-        public Header {
-            finiteColumns = unmodifiableSet(new LinkedHashSet<>(finiteColumns));
-            var sorted = new TreeSet<>(BY_EXCLUSIONS);
-            openColumns.forEach(exclusions -> sorted.add(unmodifiableSet(new LinkedHashSet<>(exclusions))));
-            openColumns = unmodifiableSortedSet(sorted);
-            // Only the columns of this header stay bound: narrowing a header (sub, filter, select) drops the
-            // bindings of the columns it removes along with them.
-            var bound = new LinkedHashMap<>(columnExpr);
-            bound.keySet().retainAll(names(finiteColumns, openColumns));
-            columnExpr = unmodifiableMap(bound);
-        }
-
-        /** The canonical names of every column, regular then packed. */
-        private static Set<String> names(Set<String> finiteColumns, Set<Set<String>> openColumns) {
-            var names = new LinkedHashSet<>(finiteColumns);
-            openColumns.forEach(exclusions -> names.add(mapOpen(exclusions)));
-            return names;
-        }
-
-        /** The attribute producing a regular column, or null when the table lacks it or the header is a requirement. */
-        public Attribute getExpr(String name) {
-            return columnExpr.get(name);
-        }
-
-        /** The attribute producing a packed column, or null when the table lacks it or the header is a requirement. */
-        public Attribute getExpr(Set<String> exclusions) {
-            return columnExpr.get(mapOpen(exclusions));
-        }
-
-        public boolean isEmpty() {
-            return finiteColumns.isEmpty() && openColumns.isEmpty();
-        }
-
-        /** True when the header has at least one packed column. */
-        public boolean isOpen() {
-            return openColumns.isEmpty() == false;
-        }
-
-        /** True when every column is bound to an attribute: the header of a translated table rather than a requirement. */
-        public boolean isBound() {
-            return columnExpr.keySet().containsAll(names(finiteColumns, openColumns));
-        }
-
-        /** The attributes of a bound header as grouping keys: packed columns by increasing exclusions, then regular columns. */
-        public List<Attribute> expressions() {
-            assert isBound() : "invariant: only a bound header has key attributes: " + this;
-            var attributes = new ArrayList<Attribute>();
-            openColumns.forEach(exclusions -> attributes.add(getExpr(exclusions)));
-            finiteColumns.forEach(name -> attributes.add(getExpr(name)));
-            return attributes;
-        }
-
-        /**
-         * The columns of this bound header {@code plan} does not produce yet, as the null-valued definitions it must
-         * add: the columns {@link TranslationContext#bind(Header, Header)} could not resolve against the input,
-         * or any attribute minted for a column the table lacks.
-         */
-        public List<Alias> nullFills(LogicalPlan plan) {
-            var outputs = plan.outputSet();
-            return expressions().stream()
-                .filter(expr -> outputs.contains(expr) == false)
-                .map(TranslationContext::emitNullExpression)
-                .toList();
-        }
-
-        /** Every binding replaced through {@code rebind}: the same columns over a plan whose attributes changed. */
-        public Header map(UnaryOperator<Attribute> rebind) {
-            var rebound = new LinkedHashMap<>(columnExpr);
-            rebound.replaceAll((name, expr) -> rebind.apply(expr));
-            return new Header(finiteColumns, openColumns, rebound);
-        }
+        this.columnExpr = unmodifiableMap(new LinkedHashMap<>(columnExpr));
     }
 
-    // -- header algebra --
-    // Constructors lift names into headers; every operator is then Header x Header, so label sets never travel as
-    // bare collections: `union(sub(req, dropped), open(dropped))` reads as the set expression it computes.
+    // ---------- constants ----------
 
-    /** The classic-histogram bucket bound as a header, for the histogram functions that consume it. */
-    static final Header _LE = finite(List.of(HistogramFunctionCall.LE_LABEL));
+    /** No columns: a scalar's header, and the identity of {@link #union(TranslationContext[])}. */
+    public static final TranslationContext PassThrough = new TranslationContext(Set.of(), Set.of(), Map.of());
 
-    /** Exactly these labels, each as its own column. */
-    public static Header finite(Collection<String> names) {
-        return new Header(new LinkedHashSet<>(names), Set.of());
+    /** The classic-histogram bucket bound as a context, for the histogram functions that consume it. */
+    static final TranslationContext _LE = finite(List.of(HistogramFunctionCall.LE_LABEL));
+
+    // ---------- factories ----------
+
+    /** Empty context: no columns. Identity for {@link #union(TranslationContext[])}. */
+    public static TranslationContext empty() {
+        return new TranslationContext(Set.of(), Set.of(), Map.of());
     }
 
-    /** Every runtime label except {@code exclusions}, as one packed column; no exclusions is the full label space. */
-    public static Header open(Collection<String> exclusions) {
-        return new Header(Set.of(), Set.of(new LinkedHashSet<>(exclusions)));
+    /** Exactly these labels as regular columns. */
+    public static TranslationContext finite(Collection<String> names) {
+        return new TranslationContext(new LinkedHashSet<>(names), Set.of(), Map.of());
     }
 
-    /** Every runtime label except the regular columns of {@code exclusions}, as one packed column. */
-    public static Header open(Header exclusions) {
-        return open(exclusions.finiteColumns());
+    /** One packed column: all runtime labels except {@code exclusions}. */
+    public static TranslationContext open(Collection<String> exclusions) {
+        return new TranslationContext(Set.of(), Set.of(new LinkedHashSet<>(exclusions)), Map.of());
     }
 
-    /** Every runtime label **/
-    public static Header open() {
+    /** One packed column: the full label space (no exclusions). */
+    public static TranslationContext open() {
         return open(Set.of());
     }
 
-    /** The headers merged: regular and packed columns combined; a column bound in several keeps its first binding. */
-    public static Header union(Header... headers) {
-        var finiteColumns = new LinkedHashSet<String>();
-        var openColumns = new LinkedHashSet<Set<String>>();
-        var columnExpr = new LinkedHashMap<String, Attribute>();
-        for (var header : headers) {
-            finiteColumns.addAll(header.finiteColumns());
-            openColumns.addAll(header.openColumns());
-            header.columnExpr().forEach(columnExpr::putIfAbsent);
-        }
-        return new Header(finiteColumns, openColumns, columnExpr);
+    /** One packed column excluding the regular columns of {@code exclusions}. */
+    public static TranslationContext open(TranslationContext exclusions) {
+        return open(exclusions.finiteColumns);
     }
 
     /**
-     * The header transposed below a node that drops the columns of {@code dropped}: they are no longer available as
-     * columns, and every packed column must already exclude them to survive the regroup. A widened packed column is a
-     * new column nothing produces yet, so it comes back unbound.
+     * Context with all three components set explicitly. Use when building a bound context
+     * whose column expressions are already known (e.g. after packing in emitCollapse).
      */
-    public static Header sub(Header header, Header dropped) {
-        var remaining = new LinkedHashSet<>(header.finiteColumns());
-        remaining.removeAll(dropped.finiteColumns());
+    static TranslationContext of(Set<String> finiteColumns, Set<Set<String>> openColumns, Map<String, Attribute> columnExpr) {
+        return new TranslationContext(finiteColumns, openColumns, columnExpr);
+    }
+
+    /** Unbound context with only the given open columns; useful when constructing a match key. */
+    static TranslationContext ofOpenColumns(Set<Set<String>> openColumns) {
+        return new TranslationContext(Set.of(), openColumns, Map.of());
+    }
+
+    // ---------- accessors ----------
+
+    public Set<String> finiteColumns() {
+        return finiteColumns;
+    }
+
+    public SortedSet<Set<String>> openColumns() {
+        return openColumns;
+    }
+
+    public Map<String, Attribute> columnExpr() {
+        return columnExpr;
+    }
+
+    public boolean isEmpty() {
+        return finiteColumns.isEmpty() && openColumns.isEmpty();
+    }
+
+    public boolean isOpen() {
+        return openColumns.isEmpty() == false;
+    }
+
+    /** True when every column is bound to an attribute. */
+    public boolean isBound() {
+        return columnExpr.keySet().containsAll(names(finiteColumns, openColumns));
+    }
+
+    public Attribute getExpr(String name) {
+        return columnExpr.get(name);
+    }
+
+    public Attribute getExpr(Set<String> exclusions) {
+        return columnExpr.get(mapOpen(exclusions));
+    }
+
+    /**
+     * Attributes of a bound context as grouping keys:
+     * packed columns by increasing exclusions, then regular columns.
+     */
+    public List<Attribute> expressions() {
+        assert isBound() : "invariant: only a bound context has key attributes: " + this;
+        var attributes = new ArrayList<Attribute>();
+        for (var exclusions : openColumns) {
+            attributes.add(getExpr(exclusions));
+        }
+        for (var name : finiteColumns) {
+            attributes.add(getExpr(name));
+        }
+        return attributes;
+    }
+
+    /**
+     * Null-fill aliases for columns this context requires but {@code plan} does not produce.
+     */
+    public List<Alias> nullFills(LogicalPlan plan) {
+        var outputs = plan.outputSet();
+        return expressions().stream().filter(expr -> outputs.contains(expr) == false).map(TranslationContext::emitNullExpression).toList();
+    }
+
+    // ---------- instance algebra ----------
+
+    /**
+     * Union of two contexts: columns merged; where both define a binding, the left one wins.
+     */
+    public TranslationContext union(TranslationContext other) {
+        var finite = new LinkedHashSet<>(this.finiteColumns);
+        finite.addAll(other.finiteColumns);
+
+        var open = new LinkedHashSet<Set<String>>();
+        open.addAll(this.openColumns);
+        open.addAll(other.openColumns);
+
+        var exprs = new LinkedHashMap<>(this.columnExpr);
+        other.columnExpr.forEach(exprs::putIfAbsent);
+
+        return new TranslationContext(finite, open, exprs);
+    }
+
+    /**
+     * Transpose this context below a node that drops the columns in {@code dropped}.
+     * Regular columns in {@code dropped} are removed; packed columns are widened to exclude them.
+     * Stale bindings (for dropped or widened columns) are silently dropped.
+     */
+    public TranslationContext sub(TranslationContext dropped) {
+        var remaining = new LinkedHashSet<>(this.finiteColumns);
+        remaining.removeAll(dropped.finiteColumns);
+
         var widened = new LinkedHashSet<Set<String>>();
-        for (var exclusions : header.openColumns()) {
-            var wider = new LinkedHashSet<>(exclusions);
-            wider.addAll(dropped.finiteColumns());
-            widened.add(wider);
+        for (var exclusions : this.openColumns) {
+            var w = new LinkedHashSet<>(exclusions);
+            w.addAll(dropped.finiteColumns);
+            widened.add(w);
         }
-        return new Header(remaining, widened, header.columnExpr());
-    }
 
-    /** Only the regular columns also in {@code kept}; packed columns unchanged. Trims a header to what a table can produce. */
-    public static Header filter(Header header, Header kept) {
-        var retained = new LinkedHashSet<>(header.finiteColumns());
-        retained.retainAll(kept.finiteColumns());
-        return new Header(retained, header.openColumns(), header.columnExpr());
+        // Bindings for dropped finite columns and now-stale open-column canonical names are removed.
+        var exprs = new LinkedHashMap<>(this.columnExpr);
+        exprs.keySet().retainAll(names(remaining, widened));
+
+        return new TranslationContext(remaining, widened, exprs);
     }
 
     /**
-     * The columns of {@code header} selected by a node that drops the columns of {@code dropped}: regular columns outside
-     * the set and packed columns already excluding all of it, bindings kept. The upward counterpart of {@link #sub}.
+     * Keep only regular columns that are also in {@code kept}; packed columns unchanged.
+     * Bindings for removed columns are silently dropped.
      */
-    public static Header select(Header header, Header dropped) {
-        var remaining = new LinkedHashSet<>(header.finiteColumns());
-        remaining.removeAll(dropped.finiteColumns());
+    public TranslationContext filter(TranslationContext kept) {
+        var retained = new LinkedHashSet<>(this.finiteColumns);
+        retained.retainAll(kept.finiteColumns);
+
+        var exprs = new LinkedHashMap<>(this.columnExpr);
+        exprs.keySet().retainAll(names(retained, this.openColumns));
+
+        return new TranslationContext(retained, this.openColumns, exprs);
+    }
+
+    /**
+     * Select columns that survive a node dropping {@code dropped}:
+     * regular columns outside {@code dropped}, packed columns that already exclude all of it.
+     * Bindings for removed columns are silently dropped.
+     */
+    public TranslationContext select(TranslationContext dropped) {
+        var remaining = new LinkedHashSet<>(this.finiteColumns);
+        remaining.removeAll(dropped.finiteColumns);
+
         var covering = new LinkedHashSet<Set<String>>();
-        for (var exclusions : header.openColumns()) {
-            if (exclusions.containsAll(dropped.finiteColumns())) {
+        for (var exclusions : this.openColumns) {
+            if (exclusions.containsAll(dropped.finiteColumns)) {
                 covering.add(exclusions);
             }
         }
-        return new Header(remaining, covering, header.columnExpr());
+
+        var exprs = new LinkedHashMap<>(this.columnExpr);
+        exprs.keySet().retainAll(names(remaining, covering));
+
+        return new TranslationContext(remaining, covering, exprs);
     }
 
     /**
-     * The requirement {@code header} bound to the columns of {@code input}: every packed column to the attribute the
-     * input has for it, every regular column to the input's attribute or, where the input lacks the column, to a fresh
-     * reference a plan must define as null ({@link Header#nullFills}). A declared label the input lacks is absent from
-     * every series, so it groups under null like in Prometheus.
+     * Bind this requirement context to the attributes provided by {@code input}.
+     * Packed columns must exist in {@code input}; missing regular columns become null-fill references.
      */
-    public static Header bind(Header header, Header input) {
+    public TranslationContext bind(TranslationContext input) {
         var bound = new LinkedHashMap<String, Attribute>();
-        for (Set<String> exclusions : header.openColumns()) {
-            Attribute expr = input.getExpr(exclusions);
+
+        for (var exclusions : this.openColumns) {
+            var expr = input.getExpr(exclusions);
             assert expr != null : "invariant: packed column " + exclusions + " must be produced by the input " + input;
             bound.put(mapOpen(exclusions), expr);
         }
-        for (String name : header.finiteColumns()) {
-            Attribute expr = input.getExpr(name);
+
+        for (var name : this.finiteColumns) {
+            var expr = input.getExpr(name);
             bound.put(name, expr != null ? expr : mapToRef(name));
         }
-        return new Header(header.finiteColumns(), header.openColumns(), bound);
-    }
 
-    /** {@code header} with a regular column bound (or rebound) to {@code expr}, added if absent. */
-    public static Header bind(Header header, String name, Attribute expr) {
-        var finiteColumns = new LinkedHashSet<>(header.finiteColumns());
-        finiteColumns.add(name);
-        var rebound = new LinkedHashMap<>(header.columnExpr());
-        rebound.put(name, expr);
-        return new Header(finiteColumns, header.openColumns(), rebound);
-    }
-
-    /** {@code header} with a packed column bound (or rebound) to {@code expr}, added if absent. */
-    public static Header bind(Header header, Set<String> exclusions, Attribute expr) {
-        var openColumns = new LinkedHashSet<>(header.openColumns());
-        openColumns.add(exclusions);
-        var rebound = new LinkedHashMap<>(header.columnExpr());
-        rebound.put(mapOpen(exclusions), expr);
-        return new Header(header.finiteColumns(), openColumns, rebound);
+        return new TranslationContext(this.finiteColumns, this.openColumns, bound);
     }
 
     /**
-     * The single value flowing through the compiler: a table - an ESQL plan together with its defined columns. A
-     * {@link Header} flows down as the columns a subtree must expose; what flows up is this table itself - the plan
-     * plus its header, every column bound to the plan attribute producing it. Every AST node translates to one and the
-     * stitching operations (joins, unions, aggregates, the command coda) compose them by their declared columns.
-     * Mid-descent the value is a (possibly not yet materialized) expression parents compose into larger expressions;
-     * a finished table's value is a defined column ({@link #valueColumn()}).
+     * Add or rebind a regular column.
      */
-    record IntermediateResult(
-        /* Output ESQL plan: the source relation (cmd.child()) with this node's operators stacked on top. */
-        LogicalPlan plan,
-        /* The regular and packed columns this subtree exposes, each bound to the plan output. */
-        Header header,
-        /* This node's numeric value: an expression mid-descent, a defined column once aggregated. */
-        Expression value,
-        /* The step column. */
-        Attribute step,
-        /* Label matcher predicate; flows up until pushed to the relation or folded into an aggregate filter. */
-        Expression pendingFilter,
-        /* The translator tracks what it built instead of inspecting the plan. */
-        Kind kind
-    ) {
+    public TranslationContext bind(String name, Attribute expr) {
+        var finite = new LinkedHashSet<>(this.finiteColumns);
+        finite.add(name);
 
-        IntermediateResult {
-            assert header.isBound() : "invariant: a translated table binds every column of its header: " + header;
-            assert header.columnExpr().values().stream().allMatch(plan.outputSet()::contains)
-                : "invariant: column expressions must belong to the output of " + plan;
+        var exprs = new LinkedHashMap<>(this.columnExpr);
+        exprs.put(name, expr);
+
+        return new TranslationContext(finite, this.openColumns, exprs);
+    }
+
+    /**
+     * Add or rebind a packed column.
+     */
+    public TranslationContext bind(Set<String> exclusions, Attribute expr) {
+        var open = new LinkedHashSet<>(this.openColumns);
+        open.add(exclusions);
+
+        var exprs = new LinkedHashMap<>(this.columnExpr);
+        exprs.put(mapOpen(exclusions), expr);
+
+        return new TranslationContext(this.finiteColumns, open, exprs);
+    }
+
+    /**
+     * Rebind every attribute through {@code rebind}.
+     */
+    public TranslationContext map(UnaryOperator<Attribute> rebind) {
+        var exprs = new LinkedHashMap<>(this.columnExpr);
+        exprs.replaceAll((k, v) -> rebind.apply(v));
+        return new TranslationContext(this.finiteColumns, this.openColumns, exprs);
+    }
+
+    // ---------- static algebra (forward to instance methods for callers that static-import them) ----------
+
+    public static TranslationContext union(TranslationContext... headers) {
+        var result = PassThrough;
+        for (var h : headers) {
+            result = result.union(h);
         }
+        return result;
+    }
 
-        /** The lifecycle of an intermediate result. A constant is always a finished (aggregation-free) local relation. */
-        enum Kind {
+    public static TranslationContext sub(TranslationContext header, TranslationContext dropped) {
+        return header.sub(dropped);
+    }
+
+    public static TranslationContext filter(TranslationContext header, TranslationContext kept) {
+        return header.filter(kept);
+    }
+
+    public static TranslationContext select(TranslationContext header, TranslationContext dropped) {
+        return header.select(dropped);
+    }
+
+    public static TranslationContext bind(TranslationContext header, TranslationContext input) {
+        return header.bind(input);
+    }
+
+    public static TranslationContext bind(TranslationContext header, String name, Attribute expr) {
+        return header.bind(name, expr);
+    }
+
+    public static TranslationContext bind(TranslationContext header, Set<String> exclusions, Attribute expr) {
+        return header.bind(exclusions, expr);
+    }
+
+    // ---------- helpers ----------
+
+    private static Set<String> names(Set<String> finiteColumns, Set<Set<String>> openColumns) {
+        var names = new LinkedHashSet<>(finiteColumns);
+        for (var ex : openColumns) {
+            names.add(mapOpen(ex));
+        }
+        return names;
+    }
+
+    static Alias emitNullExpression(Attribute attribute) {
+        var nullLiteral = new Literal(attribute.source(), null, attribute.resolved() ? attribute.dataType() : DataType.KEYWORD);
+        return new Alias(attribute.source(), attribute.name(), nullLiteral, attribute.id());
+    }
+
+    // ---------- equality ----------
+
+    @Override
+    public boolean equals(Object obj) {
+        if (this == obj) return true;
+        if (obj instanceof TranslationContext other) {
+            return finiteColumns.equals(other.finiteColumns)
+                && openColumns.equals(other.openColumns)
+                && columnExpr.equals(other.columnExpr);
+        }
+        return false;
+    }
+
+    @Override
+    public int hashCode() {
+        return Objects.hash(finiteColumns, openColumns, columnExpr);
+    }
+
+    @Override
+    public String toString() {
+        return "TranslationContext{finite=" + finiteColumns + ", open=" + openColumns + ", exprs=" + columnExpr.keySet() + "}";
+    }
+
+    // ---------- IR ----------
+
+    /**
+     * The result of translating a PromQL AST node: a plan plus its exposed columns and numeric value.
+     * <p>
+     * Invariants:
+     * - context is bound;
+     * - every context expression belongs to the plan's output.
+     */
+    public static final class IntermediateResult {
+
+        private final LogicalPlan plan;
+        private final TranslationContext context;
+        private final Expression value;
+        private final Attribute step;
+        private final Expression pendingFilter;
+        private final Kind kind;
+
+        public enum Kind {
             BEFORE_INITIAL_AGGREGATE(false, false),
             AFTER_INITIAL_AGGREGATE(true, false),
             CONSTANT(true, true);
 
-            final boolean constant;
-            final boolean afterInitialAggregation;
+            public final boolean constant;
+            public final boolean afterInitialAggregation;
 
             Kind(boolean afterInitialAggregation, boolean constant) {
                 this.afterInitialAggregation = afterInitialAggregation;
@@ -318,45 +418,108 @@ public final class TranslationContext {
             }
         }
 
-        IntermediateResult(LogicalPlan plan, Expression value, Attribute step) {
-            this(plan, value, step, null, Kind.BEFORE_INITIAL_AGGREGATE);
+        IntermediateResult(
+            LogicalPlan plan,
+            TranslationContext context,
+            Expression value,
+            Attribute step,
+            Expression pendingFilter,
+            Kind kind
+        ) {
+            Objects.requireNonNull(plan, "plan");
+            Objects.requireNonNull(context, "context");
+            Objects.requireNonNull(step, "step");
+            Objects.requireNonNull(kind, "kind");
+
+            assert context.isBound() : "invariant: a translated table binds every column of its context: " + context;
+            assert context.columnExpr().values().stream().allMatch(plan.outputSet()::contains)
+                : "invariant: column expressions must belong to the output of " + plan;
+
+            this.plan = plan;
+            this.context = context;
+            this.value = value;
+            this.step = step;
+            this.pendingFilter = pendingFilter;
+            this.kind = kind;
         }
 
-        IntermediateResult(LogicalPlan plan, Expression value, Attribute step, Expression selectorFilter) {
-            this(plan, value, step, selectorFilter, Kind.BEFORE_INITIAL_AGGREGATE);
+        // ---------- convenient factories that encode valid states ----------
+
+        /** Scalar/local relation before any aggregation. */
+        public static IntermediateResult scalar(LogicalPlan plan, Expression value, Attribute step) {
+            return new IntermediateResult(plan, PassThrough, value, step, null, Kind.BEFORE_INITIAL_AGGREGATE);
         }
 
-        IntermediateResult(LogicalPlan plan, Expression value, Attribute step, Expression filter, Kind kind) {
-            this(plan, Header.PassThrough, value, step, filter, kind);
+        /** Scalar with a pending label matcher filter. */
+        public static IntermediateResult scalar(LogicalPlan plan, Expression value, Attribute step, Expression selectorFilter) {
+            return new IntermediateResult(plan, PassThrough, value, step, selectorFilter, Kind.BEFORE_INITIAL_AGGREGATE);
         }
 
-        /** This table rebuilt around a new plan and value, keeping its header and other properties. */
-        IntermediateResult with(LogicalPlan plan, Expression value) {
-            return with(plan, header, value);
+        /** Aggregated table with explicit context. */
+        public static IntermediateResult aggregated(LogicalPlan plan, TranslationContext context, Attribute valueColumn, Attribute step) {
+            return new IntermediateResult(plan, context, valueColumn, step, null, Kind.AFTER_INITIAL_AGGREGATE);
         }
 
-        /** This table rebuilt around a new plan, header and value, keeping its other properties. */
-        IntermediateResult with(LogicalPlan plan, Header header, Expression value) {
-            return new IntermediateResult(plan, header, value, step, pendingFilter, kind);
+        /** Constant (aggregation-free) local relation. */
+        public static IntermediateResult constant(LogicalPlan plan, TranslationContext context, Attribute valueColumn, Attribute step) {
+            return new IntermediateResult(plan, context, valueColumn, step, null, Kind.CONSTANT);
         }
 
-        /** The value as a defined column; only valid on a finished table. */
-        Attribute valueColumn() {
+        // ---------- accessors ----------
+
+        public LogicalPlan plan() {
+            return plan;
+        }
+
+        public TranslationContext context() {
+            return context;
+        }
+
+        public Expression value() {
+            return value;
+        }
+
+        public Attribute step() {
+            return step;
+        }
+
+        public Expression pendingFilter() {
+            return pendingFilter;
+        }
+
+        public Kind kind() {
+            return kind;
+        }
+
+        /** The value as a defined column; valid only when the value is an attribute. */
+        public Attribute valueColumn() {
             return (Attribute) value;
         }
 
-        /** The attribute producing a regular column in this table's plan, or null when the table lacks it. */
-        Attribute getExpr(String name) {
-            return header.getExpr(name);
+        public Attribute getExpr(String name) {
+            return context.getExpr(name);
         }
 
-        /** The attribute producing a packed column in this table's plan, or null when the table lacks it. */
-        Attribute getExpr(Set<String> exclusions) {
-            return header.getExpr(exclusions);
+        public Attribute getExpr(Set<String> exclusions) {
+            return context.getExpr(exclusions);
+        }
+
+        /**
+         * Rebuild around a new plan and value, keeping context and other properties.
+         */
+        public IntermediateResult with(LogicalPlan plan, Expression value) {
+            return new IntermediateResult(plan, context, value, step, pendingFilter, kind);
+        }
+
+        /**
+         * Rebuild around a new plan, context and value, keeping other properties.
+         */
+        public IntermediateResult with(LogicalPlan plan, TranslationContext context, Expression value) {
+            return new IntermediateResult(plan, context, value, step, pendingFilter, kind);
         }
     }
 
-    // -- helpers --
+    // ---------- Name mapping helpers ----------
 
     static String mapOpen() {
         return mapOpen(Set.of());
@@ -380,12 +543,6 @@ public final class TranslationContext {
         return new ReferenceAttribute(Source.EMPTY, null, name, DataType.KEYWORD);
     }
 
-    /** A null-valued column under the attribute's own name and id, typed like the attribute (keyword when unresolved). */
-    static Alias emitNullExpression(Attribute attribute) {
-        var nullLiteral = new Literal(attribute.source(), null, attribute.resolved() ? attribute.dataType() : DataType.KEYWORD);
-        return new Alias(attribute.source(), attribute.name(), nullLiteral, attribute.id());
-    }
-
     public static Attribute find(List<Attribute> attributes, String label) {
         Attribute bareMatch = null;
         for (Attribute attribute : attributes) {
@@ -407,7 +564,6 @@ public final class TranslationContext {
                 }
             }
         }
-
         return null;
     }
 }

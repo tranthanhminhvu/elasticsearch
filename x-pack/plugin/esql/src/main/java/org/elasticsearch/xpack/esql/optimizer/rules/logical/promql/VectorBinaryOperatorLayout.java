@@ -16,7 +16,6 @@ import org.elasticsearch.xpack.esql.core.expression.ReferenceAttribute;
 import org.elasticsearch.xpack.esql.core.type.DataType;
 import org.elasticsearch.xpack.esql.expression.function.scalar.convert.ToDouble;
 import org.elasticsearch.xpack.esql.optimizer.rules.logical.TemporaryNameGenerator;
-import org.elasticsearch.xpack.esql.optimizer.rules.logical.promql.TranslationContext.Header;
 import org.elasticsearch.xpack.esql.optimizer.rules.logical.promql.TranslationContext.IntermediateResult;
 import org.elasticsearch.xpack.esql.optimizer.rules.logical.promql.TranslationContext.IntermediateResult.Kind;
 import org.elasticsearch.xpack.esql.plan.logical.Eval;
@@ -44,6 +43,8 @@ import static org.elasticsearch.xpack.esql.optimizer.rules.logical.promql.Transl
 import static org.elasticsearch.xpack.esql.optimizer.rules.logical.promql.TranslationContext.find;
 import static org.elasticsearch.xpack.esql.optimizer.rules.logical.promql.TranslationContext.finite;
 import static org.elasticsearch.xpack.esql.optimizer.rules.logical.promql.TranslationContext.mapToRef;
+import static org.elasticsearch.xpack.esql.optimizer.rules.logical.promql.TranslationContext.of;
+import static org.elasticsearch.xpack.esql.optimizer.rules.logical.promql.TranslationContext.ofOpenColumns;
 import static org.elasticsearch.xpack.esql.optimizer.rules.logical.promql.TranslationContext.select;
 import static org.elasticsearch.xpack.esql.optimizer.rules.logical.promql.TranslationContext.union;
 import static org.elasticsearch.xpack.esql.plan.logical.promql.operator.VectorMatch.Joining;
@@ -71,7 +72,7 @@ final class VectorBinaryOperatorLayout {
     private PromqlCommand cmd;
     private Configuration configuration;
     private NameId stepId;
-    private Header header;
+    private TranslationContext header;
     private IntermediateResult left;
     private IntermediateResult right;
 
@@ -98,7 +99,7 @@ final class VectorBinaryOperatorLayout {
     }
 
     /** The labels the result exposes; a label the match dropped null-fills rather than leaking from an operand. */
-    VectorBinaryOperatorLayout header(Header header) {
+    VectorBinaryOperatorLayout header(TranslationContext header) {
         this.header = header;
         return this;
     }
@@ -141,8 +142,8 @@ final class VectorBinaryOperatorLayout {
         if (match.filter() == VectorMatch.Filter.ON) {
             return List.copyOf(match.filterLabels());
         }
-        var names = new TreeSet<>(left.header().finiteColumns());
-        names.addAll(right.header().finiteColumns());
+        var names = new TreeSet<>(left.context().finiteColumns());
+        names.addAll(right.context().finiteColumns());
         names.removeAll(match.filterLabels());
         return List.copyOf(names);
     }
@@ -171,12 +172,12 @@ final class VectorBinaryOperatorLayout {
             plan = new Filter(op.source(), plan, filter);
         }
         List<NamedExpression> projected = new ArrayList<>(List.of(valueAlias.toAttribute(), stepAlias.toAttribute()));
-        projected.addAll(output.header().expressions());
+        projected.addAll(output.context().expressions());
         plan = new Project(cmd.source(), plan, projected);
 
         return new IntermediateResult(
             plan,
-            output.header(),
+            output.context(),
             valueAlias.toAttribute(),
             stepAlias.toAttribute(),
             null,
@@ -197,7 +198,7 @@ final class VectorBinaryOperatorLayout {
             .transformExpressionsDown(Expression.class, e -> reidExpr(renamed(e, cmd.valueColumnName(), valueName), ids));
         Expression value = reidExpr(renamed(input.valueColumn(), cmd.valueColumnName(), valueName), ids);
         Attribute step = (Attribute) reidExpr(input.step(), ids);
-        Header reidentified = input.header().map(expr -> (Attribute) reidExpr(expr, ids));
+        TranslationContext reidentified = input.context().map(expr -> (Attribute) reidExpr(expr, ids));
         return new IntermediateResult(plan, reidentified, value, step, input.pendingFilter(), input.kind());
     }
 
@@ -239,7 +240,7 @@ final class VectorBinaryOperatorLayout {
 
     /** One side's plan with its match key defined and packed next to step; step alone when the key is empty. */
     private Input emitInput(IntermediateResult input, List<String> keyLabels) {
-        Header key = joinKey(input, keyLabels);
+        TranslationContext key = joinKey(input, keyLabels);
         List<Alias> nullFills = key.nullFills(input.plan());
         LogicalPlan plan = nullFills.isEmpty() ? input.plan() : new Eval(cmd.source(), input.plan(), nullFills);
         if (key.isEmpty()) {
@@ -253,13 +254,13 @@ final class VectorBinaryOperatorLayout {
      * The operand's match key columns: its packed columns that already exclude the ignored labels (an opaque operand under
      * ignoring), then the shared key labels, each as the operand's own column or a null where it lacks the label.
      */
-    private Header joinKey(IntermediateResult input, List<String> keyLabels) {
-        Header key = finite(keyLabels);
+    private TranslationContext joinKey(IntermediateResult input, List<String> keyLabels) {
+        TranslationContext key = finite(keyLabels);
         if (match.filter() != VectorMatch.Filter.ON) {
-            Header selected = select(input.header(), finite(match.filterLabels()));
-            key = union(new Header(Set.of(), selected.openColumns()), key);
+            TranslationContext selected = select(input.context(), finite(match.filterLabels()));
+            key = union(ofOpenColumns(selected.openColumns()), key);
         }
-        return bind(key, input.header());
+        return bind(key, input.context());
     }
 
     /** The join result's label columns: every header label bound to the operand carrying it, or to null. */
@@ -287,11 +288,11 @@ final class VectorBinaryOperatorLayout {
             columnExpr.put(name, attribute);
         }
         // Operands are required to have concrete label sets, so the result names every label and carries no packed column.
-        return new Output(new Header(header.finiteColumns(), Set.of(), columnExpr), nullFills);
+        return new Output(of(header.finiteColumns(), Set.of(), columnExpr), nullFills);
     }
 
     /** The join result's label columns, and the ones defined as null rather than taken from an operand. */
-    private record Output(Header header, List<Alias> nullFills) {}
+    private record Output(TranslationContext context, List<Alias> nullFills) {}
 
     /** Renames an attribute or alias in a re-identification pass; other expressions pass through unchanged. */
     private static Expression renamed(Expression e, String from, String to) {
