@@ -223,18 +223,20 @@ public final class TranslatePromqlToEsqlPlan extends AnalyzerRules.Parameterized
                 return doTranslateFinal(ir.plan(), identityColumn(ir.context()), ir.kind().constant);
             }
             // Compile every branch as its own module (own step/value ids, own shifted evaluation timestamp), then link.
-            var intermediateResultPlan = doTranslateUnion(
-                branches.stream().map(b -> translateIntermediate(b, new NameId(), new NameId())).toList()
-            );
-            return doTranslateFinal(intermediateResultPlan, null, false);
+            var irs = branches.stream().map(b -> translateIntermediate(b, new NameId(), new NameId())).toList();
+            var intermediateResultPlan = doTranslateUnion(irs);
+            Attribute firstIdentity = identityColumn(irs.get(0).context());
+            Attribute unionIdentity = firstIdentity == null
+                ? null
+                : intermediateResultPlan.output().stream().filter(a -> a.name().equals(firstIdentity.name())).findFirst().orElse(null);
+            return doTranslateFinal(intermediateResultPlan, unionIdentity, false);
         }
 
         // -- helpers --
 
         /**
          * Shared by every `final` translation root. {@code identity} is the column carrying the result's series identity
-         * (see {@link #identityColumn}), or null when the result is finite or the union already exposes it as
-         * {@code _timeseries}.
+         * (see {@link #identityColumn}), or null when the result is finite.
          */
         private LogicalPlan doTranslateFinal(LogicalPlan plan, Attribute identity, boolean localRelation) {
             plan = emitNullsFilter(cmd.source(), emitFinalProjection(plan, identity), cmd.valueAttribute());
@@ -260,12 +262,13 @@ public final class TranslatePromqlToEsqlPlan extends AnalyzerRules.Parameterized
             for (int i = 0; i < intermediateResults.size(); i++) {
                 var ir = intermediateResults.get(i);
                 LogicalPlan branchPlan = ir.plan();
-                // Each branch is projected to its public shape: value, step, its labels, its series identity as
-                // `_timeseries` and the branch tag. The union aligns columns by name and the dedup below keys on every
-                // non-value column, so this is the exact set the branches must agree on; the collapse's own identity
-                // column (e.g. `_timeseries$__name__`) stays behind. The explicit projection also pins the page layout
-                // to the branch output: pages cross an exchange and an Eval below (the value double-cast) can
-                // name-shadow a column, leaving its channel in the page but not in output() (see #158164).
+                // Each branch is projected to its public shape: value, step, its labels, its series identity
+                // (with its natural name, e.g. `_timeseries$__name__`) and the branch tag. The union aligns
+                // columns by name and the dedup below keys on every non-value column. The final rename to
+                // `_timeseries` is deferred to emitFinalProjection so the dedup groups on semantically
+                // consistent keys. The explicit projection also pins the page layout to the branch output:
+                // pages cross an exchange and an Eval below (the value double-cast) can name-shadow a column,
+                // leaving its channel in the page but not in output() (see #158164).
                 var branchOutput = new ArrayList<Attribute>();
                 branchOutput.add(ir.valueColumn());
                 branchOutput.add(ir.step());
@@ -274,11 +277,6 @@ public final class TranslatePromqlToEsqlPlan extends AnalyzerRules.Parameterized
                 }
                 Attribute identity = identityColumn(ir.context());
                 if (identity != null) {
-                    if (identity.name().equals(MetadataAttribute.TIMESERIES) == false) {
-                        var alias = new Alias(source, MetadataAttribute.TIMESERIES, identity, new NameId());
-                        branchPlan = new Eval(source, branchPlan, List.of(alias));
-                        identity = alias.toAttribute();
-                    }
                     branchOutput.add(identity);
                 }
                 // Drop null-valued rows per branch so an absent left side does not shadow a present right side.
